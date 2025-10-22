@@ -59,8 +59,13 @@ else
   fi
 fi
 
-# Get changed files
-mapfile -t changed_files < <(git diff --name-only "$diff_base" "$current_commit")
+# Get changed files (portable, avoids mapfile)
+changed_files=()
+while IFS= read -r path; do
+  if [[ -n "$path" ]]; then
+    changed_files+=("$path")
+  fi
+done < <(git diff --name-only "$diff_base" "$current_commit")
 
 if [[ ${#changed_files[@]} -eq 0 ]]; then
   exit 0
