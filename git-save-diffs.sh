@@ -5,12 +5,29 @@ set -euo pipefail
 # diff against default branch head (master/main/origin default). Otherwise, diff against previous commit.
 # Output: prints the saved diff filenames, one per line.
 
+# Flags
+VERBOSE=false
+while getopts ":v" opt; do
+  case "$opt" in
+    v) VERBOSE=true ;;
+    *) : ;;
+  esac
+done
+
+log() { $VERBOSE && printf "%s\n" "$*" >&2 || :; }
+
 # Ensure we are inside a git repo
-REPO_ROOT=$(git rev-parse --show-toplevel)
+if ! REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
+  printf "Not a git repository: %s\n" "$(pwd)" >&2
+  exit 0
+fi
 cd "$REPO_ROOT"
+log "Repo root: $REPO_ROOT"
 
 current_commit=$(git rev-parse HEAD)
 current_branch=$(git rev-parse --abbrev-ref HEAD)
+log "Current commit: $current_commit"
+log "Current branch: $current_branch"
 
 # Determine default branch (prefer local master/main, else remote master/main, else origin/HEAD)
 resolve_default_branch() {
@@ -32,10 +49,12 @@ resolve_default_branch() {
   return 1
 }
 
-if ! default_branch=$(resolve_default_branch); then
-  echo "Could not determine default branch (master/main/origin HEAD)." >&2
-  exit 1
+# Try to resolve default branch, but do not exit if unavailable
+default_branch=""
+if resolved=$(resolve_default_branch); then
+  default_branch="$resolved"
 fi
+log "Default branch: ${default_branch:-<none>}"
 
 # Are we on the default branch? Normalize names to compare
 simplified_default=${default_branch##*/}
@@ -43,21 +62,46 @@ on_default_branch=false
 if [[ "$current_branch" == "$simplified_default" ]]; then
   on_default_branch=true
 fi
+log "On default branch? $on_default_branch"
 
 # Find merge-base with default branch and count commits since base
-merge_base=$(git merge-base "$current_commit" "$default_branch")
-commits_since_base=$(git rev-list --count "$merge_base..$current_commit")
+commits_since_base=0
+if [[ -n "$default_branch" ]]; then
+  merge_base=$(git merge-base "$current_commit" "$default_branch")
+  commits_since_base=$(git rev-list --count "$merge_base..$current_commit")
+fi
+log "Commits since base: $commits_since_base"
 
 # Choose diff base
-if $on_default_branch; then
-  diff_base="$current_commit^"
+# Helper: determine if current commit has a parent
+if git rev-parse --verify -q "$current_commit^" >/dev/null; then
+  has_parent=true
 else
-  if [[ "$commits_since_base" -le 1 ]]; then
+  has_parent=false
+fi
+
+# Helper: empty tree for initial commit diffs
+empty_tree=$(git hash-object -t tree /dev/null)
+
+# Choose diff base without exiting on missing default branch
+if $on_default_branch; then
+  if $has_parent; then
+    diff_base="$current_commit^"
+  else
+    diff_base="$empty_tree"
+  fi
+else
+  if [[ -n "$default_branch" && "$commits_since_base" -le 1 ]]; then
     diff_base=$(git rev-parse "$default_branch")
   else
-    diff_base="$current_commit^"
+    if $has_parent; then
+      diff_base="$current_commit^"
+    else
+      diff_base="$empty_tree"
+    fi
   fi
 fi
+log "Diff base: $diff_base"
 
 # Get changed files (portable, avoids mapfile)
 changed_files=()
@@ -66,9 +110,10 @@ while IFS= read -r path; do
     changed_files+=("$path")
   fi
 done < <(git diff --name-only "$diff_base" "$current_commit")
+log "Changed files count: ${#changed_files[@]}"
 
 if [[ ${#changed_files[@]} -eq 0 ]]; then
-  exit 0
+  log "No changes detected."
 fi
 
 created_files=()
@@ -95,9 +140,11 @@ for path in "${changed_files[@]}"; do
   git diff "$diff_base" "$current_commit" -- "$path" > "$out_file" || true
   if [[ ! -s "$out_file" ]]; then
     rm -f "$out_file"
+    log "Empty diff for $path, skipping"
     continue
   fi
   created_files+=("$out_file")
+  log "Created: $out_file"
 
 done
 
