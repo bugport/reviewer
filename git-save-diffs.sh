@@ -1,183 +1,153 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-# save-commit-diffs.sh
-# Splits the current commit's diff into per-hunk files saved next to source files.
-# Filenames follow: source_filename.START-END.diff where START-END is the changed
-# line range in the source (using new-file line numbers, or old-file for deletions).
+# git-save-diffs.sh
 #
-# Diff target selection:
-# - If this is the first commit on the branch (ahead-of-merge-base == 1), diff is HEAD vs master/main head
-# - Otherwise, diff is HEAD^ vs HEAD (current commit vs its parent)
+# Generates per-hunk diff files for the current commit relative to:
+# - master/main HEAD if this is the first commit on the branch since diverging
+# - otherwise the immediate parent commit (HEAD~1)
 #
-# Output: prints each saved diff file path, one per line
+# For each changed source file, creates one or more files placed next to the
+# source file, named like: <source_filename>.<start>-<end>.diff, where <start>
+# and <end> are the line numbers on the new file side for each changed hunk.
+#
+# Outputs the paths of the created diff files, one per line.
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-if [[ -z "${repo_root}" ]]; then
-  echo "Error: not inside a git repository" >&2
+if [ -z "${repo_root}" ]; then
+  echo "Error: Not inside a git repository." >&2
   exit 1
 fi
 
 cd "${repo_root}"
 
-default_main_branch() {
-  # Prefer local master/main, else fallback to origin/* if local not present
-  if git show-ref --verify --quiet refs/heads/master; then
-    echo master
-    return
-  fi
-  if git show-ref --verify --quiet refs/heads/main; then
-    echo main
-    return
-  fi
-  if git show-ref --verify --quiet refs/remotes/origin/master; then
-    echo origin/master
-    return
-  fi
-  if git show-ref --verify --quiet refs/remotes/origin/main; then
-    echo origin/main
-    return
-  fi
-  # Fallback
-  echo master
+# Determine upstream default branch: prefer master, then main, then origin/*
+find_upstream_branch() {
+  local candidates=("master" "main" "origin/master" "origin/main")
+  local c
+  for c in "${candidates[@]}"; do
+    if git rev-parse --verify --quiet "$c" >/dev/null; then
+      echo "$c"
+      return 0
+    fi
+  done
+  return 1
 }
 
-base_branch=$(default_main_branch)
-merge_base=$(git merge-base HEAD "${base_branch}")
-ahead_count=$(git rev-list --count "${merge_base}"..HEAD)
-
-left_ref=""
-right_ref="HEAD"
-if [[ "${ahead_count}" == "1" ]]; then
-  # First commit on branch: compare branch head to master/main head
-  left_ref="${base_branch}"
-else
-  # Compare current commit to its immediate parent
-  left_ref="HEAD^"
+UPSTREAM=$(find_upstream_branch || true)
+if [ -z "${UPSTREAM}" ]; then
+  echo "Error: Could not find an upstream branch (master/main)." >&2
+  exit 1
 fi
 
-# Generate a unified diff with zero context for precise hunk ranges
-# Include file operations we care about; exclude binary diffs from content but keep headers
-diff_output=$(git diff --unified=0 --no-color --no-ext-diff --diff-filter=ACDMRTUXB "${left_ref}" "${right_ref}" || true)
+# Identify base commit according to the rules
+MERGE_BASE=$(git merge-base HEAD "${UPSTREAM}")
+COMMITS_SINCE_BASE=$(git rev-list --count "${MERGE_BASE}..HEAD")
 
-# If no diff, exit quietly
-if [[ -z "${diff_output}" ]]; then
+if [ "${COMMITS_SINCE_BASE}" -eq 1 ]; then
+  BASE_REF="${UPSTREAM}"
+else
+  BASE_REF="HEAD~1"
+fi
+
+# Collect changed files (Added or Modified). Exclude deletions and others.
+mapfile -t changed_files < <(git diff --name-only --diff-filter=AM "${BASE_REF}..HEAD")
+
+# If nothing changed, exit quietly
+if [ ${#changed_files[@]} -eq 0 ]; then
   exit 0
 fi
 
-# Parse diff and write per-hunk files
-awk -v repo_root="${repo_root}" '
-  function trim_prefix(path,   p) {
-    p = path
-    sub(/^a\//, "", p)
-    sub(/^b\//, "", p)
-    return p
-  }
+# Temporary file for collecting output filenames
+out_list=$(mktemp)
+trap 'rm -f "${out_list}"' EXIT
 
-  function parse_range(spec, arr,   m) {
-    # spec like "+123,4" or "-7" (count defaults to 1)
-    if (match(spec, /([+-])([0-9]+)(,([0-9]+))?/, m)) {
-      arr["sign"] = m[1]
-      arr["start"] = m[2] + 0
-      arr["count"] = (m[4] != "" ? m[4] + 0 : 1)
-      return 1
-    }
-    return 0
-  }
+# For each file, split its diff into per-hunk files
+for f in "${changed_files[@]}"; do
+  # Ensure directory exists (it should, as we place files next to sources)
+  dir=$(dirname -- "$f")
+  base=$(basename -- "$f")
 
-  function start_hunk_file(old_path, new_path, old_spec, new_spec,   oldR, newR, target_path, disp_start, disp_end, clean_new, clean_old, dir, base, out_path) {
-    # Determine display range and target source path
-    parse_range(old_spec, oldR)
-    parse_range(new_spec, newR)
-
-    clean_new = (new_path == "/dev/null" ? "" : trim_prefix(new_path))
-    clean_old = (old_path == "/dev/null" ? "" : trim_prefix(old_path))
-
-    if (newR["count"] > 0 && clean_new != "") {
-      disp_start = newR["start"]
-      disp_end   = newR["start"] + newR["count"] - 1
-      target_path = clean_new
-    } else {
-      # Pure deletion or no new lines: use old range
-      disp_start = oldR["start"]
-      disp_end   = oldR["start"] + oldR["count"] - 1
-      target_path = (clean_old != "" ? clean_old : clean_new)
+  # Generate zero-context diff to get precise hunk ranges; skip binaries
+  # shellcheck disable=SC2016
+  git diff -U0 "${BASE_REF}..HEAD" -- "$f" | \
+  awk -v fpath="$f" -v out_list_file="${out_list}" '
+    BEGIN {
+      idx=""; oldh=""; newh="";
+      in_hunk=0; skip=0;
+      ofile="";
     }
 
-    if (target_path == "") {
-      # Nothing to do
-      writing = 0
-      return
+    /^Binary files / {
+      # Skip binary diffs entirely
+      next
     }
 
-    # Compute output file path near the source file
-    # out_path = dirname(target_path) + "/" + basename(target_path) + ".START-END.diff"
-    dir = target_path
-    base = target_path
-    sub(/^(.*)\/(.+)$/, "\\1", dir)
-    if (dir == base) { dir = "." } # file in repo root
-    sub(/^.*\//, "", base)
-
-    out_path = repo_root "/" dir "/" base "." disp_start "-" disp_end ".diff"
-
-    # Open new file for writing
-    close(current_out)
-    current_out = out_path
-    print current_out
-
-    # Write minimal headers for context
-    print "--- " old_path > current_out
-    print "+++ " new_path > current_out
-    print current_hunk_header > current_out
-    writing = 1
-  }
-
-  BEGIN {
-    current_out = ""
-    writing = 0
-    old_path = ""
-    new_path = ""
-    current_hunk_header = ""
-  }
-
-  /^diff --git / {
-    # New file section; reset paths and stop writing to previous hunk file
-    writing = 0
-    old_path = ""
-    new_path = ""
-    next
-  }
-
-  /^--- / {
-    old_path = $2
-    next
-  }
-
-  /^\+\+\+ / {
-    new_path = $2
-    next
-  }
-
-  /^@@ / {
-    # Hunk header like: @@ -oldStart,oldCount +newStart,newCount @@
-    current_hunk_header = $0
-    # Extract range specs (fields 2 and 3)
-    # Example tokens: "@@", "-12,3", "+15,2", "@@"
-    old_spec = $2
-    new_spec = $3
-    start_hunk_file(old_path, new_path, old_spec, new_spec)
-    next
-  }
-
-  {
-    if (writing) {
-      # Write hunk body lines until next hunk/file header
-      print $0 > current_out
+    /^diff --git / {
+      # Start of file diff header
+      file_header=$0 "\n";
+      next
     }
-  }
-' <<< "${diff_output}" | tee /dev/stderr | grep -E '\.diff$' || true
 
-# Note: The awk prints each created filename to stdout before writing the hunk.
-# The tee to stderr lets users see progress while preserving stdout as the list of files.
+    /^index / {
+      idx=$0 "\n"; next
+    }
+
+    /^--- / {
+      oldh=$0 "\n"; next
+    }
+
+    /^\+\+\+ / {
+      newh=$0 "\n"; next
+    }
+
+    /^@@ / {
+      # New hunk: determine +start,len from header
+      in_hunk=1; skip=0;
+      # Extract +start,len (len optional defaults to 1)
+      if (match($0, /\+([0-9]+),?([0-9]*)/, m)) {
+        start=m[1]; len=(m[2]==""?1:m[2]);
+      } else {
+        # If cannot parse, skip this hunk
+        skip=1;
+      }
+
+      # If len==0, this hunk only deletes lines in new file; skip per requirement
+      if (len==0) { skip=1; }
+
+      if (!skip) {
+        end=start+len-1;
+        ofile=sprintf("%s.%d-%d.diff", fpath, start, end);
+
+        # Write a minimal valid header for the single-hunk diff
+        print "diff --git a/" fpath " b/" fpath > ofile;
+        if (idx != "") { printf "%s", idx > ofile }
+        if (oldh != "") { printf "%s", oldh > ofile }
+        if (newh != "") { printf "%s", newh > ofile }
+        print $0 > ofile;
+
+        # Record the created filename
+        print ofile >> out_list_file;
+      }
+      next
+    }
+
+    {
+      # Regular diff content lines; append to current hunk file if not skipping
+      if (in_hunk && !skip && ofile != "") {
+        print $0 >> ofile;
+      }
+      next
+    }
+  '
+done
+
+# Output the list of created diff filenames (one per line)
+if [ -s "${out_list}" ]; then
+  sort -u "${out_list}"
+fi
+
+exit 0
 
 
