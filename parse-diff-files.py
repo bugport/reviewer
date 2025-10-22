@@ -60,6 +60,56 @@ def parse_diff_file_path(file_path):
             'content': content
         }
 
+def parse_diff_files(input_files):
+    """
+    Parse comma-separated diff file paths and return structured information.
+    
+    Args:
+        input_files (str): Comma-separated list of diff file paths
+        
+    Returns:
+        list: List of dictionaries containing parsed information for each file
+    """
+    # Split by comma and strip whitespace
+    file_paths = [path.strip() for path in input_files.split(',')]
+    
+    results = []
+    
+    # Process each file path
+    for file_path in file_paths:
+        if not file_path:
+            continue
+            
+        parsed_info = parse_diff_file_path(file_path)
+        results.append(parsed_info)
+    
+    return results
+
+def format_output(parsed_info):
+    """
+    Format parsed information into the same output format.
+    
+    Args:
+        parsed_info (dict): Parsed file information
+        
+    Returns:
+        str: Formatted output string
+    """
+    output_lines = []
+    
+    # Output information for each file
+    output_lines.append(f"{parsed_info['filename']}")
+    if parsed_info['range']:
+        output_lines.append(f"Range: {parsed_info['range']} (lines {parsed_info['start_line']}-{parsed_info['end_line']})")
+    else:
+        output_lines.append("Range: No range found")
+    output_lines.append(f"Path: {parsed_info['full_path']}")
+    output_lines.append("Content:")
+    output_lines.append(parsed_info['content'])
+    output_lines.append("=" * 80)
+    
+    return '\n'.join(output_lines)
+
 def main():
     if len(sys.argv) != 2:
         print("Usage: python3 parse-diff-files.py <comma_separated_diff_files>")
@@ -69,26 +119,13 @@ def main():
     # Get input from command line argument
     input_files = sys.argv[1]
     
-    # Split by comma and strip whitespace
-    file_paths = [path.strip() for path in input_files.split(',')]
+    # Parse files and get results
+    results = parse_diff_files(input_files)
     
-    # Process each file path
-    for file_path in file_paths:
-        if not file_path:
-            continue
-            
-        parsed_info = parse_diff_file_path(file_path)
-        
-        # Output information for each file
-        print(f"{parsed_info['filename']}")
-        if parsed_info['range']:
-            print(f"Range: {parsed_info['range']} (lines {parsed_info['start_line']}-{parsed_info['end_line']})")
-        else:
-            print("Range: No range found")
-        print(f"Path: {parsed_info['full_path']}")
-        print("Content:")
-        print(parsed_info['content'])
-        print("=" * 80)
+    # Output formatted results
+    for parsed_info in results:
+        print(format_output(parsed_info))
 
 if __name__ == "__main__":
     main()
+# Test comment
