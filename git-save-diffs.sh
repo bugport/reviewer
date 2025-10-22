@@ -111,17 +111,14 @@ COMMIT_COUNT=$(get_commit_count)
 
 if [ "$COMMIT_COUNT" -eq 1 ]; then
     # First commit in branch - diff against master/main
-    echo "First commit in branch, comparing against master/main..."
     DIFF_CONTENT=$(get_diff "master" "HEAD" 2>/dev/null || get_diff "main" "HEAD" 2>/dev/null)
 else
     # Not first commit - diff against previous commit
-    echo "Comparing against previous commit..."
     DIFF_CONTENT=$(get_diff "HEAD~1" "HEAD")
 fi
 
 # Check if there are any changes
 if [ -z "$DIFF_CONTENT" ]; then
-    echo "No changes found for file '$SOURCE_FILE'"
     exit 0
 fi
 
@@ -133,7 +130,6 @@ BASE_DIR=$(dirname "$SOURCE_FILE")
 RANGES=$(parse_diff_ranges "$DIFF_CONTENT")
 
 if [ -z "$RANGES" ]; then
-    echo "No line ranges found in diff"
     exit 0
 fi
 
@@ -155,8 +151,9 @@ while IFS= read -r range; do
         
         # Check if file was created and has content
         if [ -s "$OUTPUT_FILE" ]; then
-            SAVED_FILES+=("$OUTPUT_FILE")
-            echo "Saved diff for range $range: $OUTPUT_FILE"
+            # Convert to absolute path
+            ABSOLUTE_PATH=$(realpath "$OUTPUT_FILE")
+            SAVED_FILES+=("$ABSOLUTE_PATH")
         else
             rm -f "$OUTPUT_FILE"
         fi
@@ -174,6 +171,4 @@ if [ ${#SAVED_FILES[@]} -gt 0 ]; then
         # Newline separated
         printf '%s\n' "${SAVED_FILES[@]}"
     fi
-else
-    echo "No diff files were saved"
 fi
