@@ -1,155 +1,183 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Save per-file diffs for the current commit. If this is the first commit on the branch,
-# diff against default branch head (master/main/origin default). Otherwise, diff against previous commit.
-# Output: prints the saved diff filenames, one per line.
+# save-commit-diffs.sh
+# Splits the current commit's diff into per-hunk files saved next to source files.
+# Filenames follow: source_filename.START-END.diff where START-END is the changed
+# line range in the source (using new-file line numbers, or old-file for deletions).
+#
+# Diff target selection:
+# - If this is the first commit on the branch (ahead-of-merge-base == 1), diff is HEAD vs master/main head
+# - Otherwise, diff is HEAD^ vs HEAD (current commit vs its parent)
+#
+# Output: prints each saved diff file path, one per line
 
-# Flags
-VERBOSE=false
-while getopts ":v" opt; do
-  case "$opt" in
-    v) VERBOSE=true ;;
-    *) : ;;
-  esac
-done
-
-log() { $VERBOSE && printf "%s\n" "$*" >&2 || :; }
-
-# Ensure we are inside a git repo
-if ! REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
-  printf "Not a git repository: %s\n" "$(pwd)" >&2
-  exit 0
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [[ -z "${repo_root}" ]]; then
+  echo "Error: not inside a git repository" >&2
+  exit 1
 fi
-cd "$REPO_ROOT"
-log "Repo root: $REPO_ROOT"
 
-current_commit=$(git rev-parse HEAD)
-current_branch=$(git rev-parse --abbrev-ref HEAD)
-log "Current commit: $current_commit"
-log "Current branch: $current_branch"
+cd "${repo_root}"
 
-# Determine default branch (prefer local master/main, else remote master/main, else origin/HEAD)
-resolve_default_branch() {
+default_main_branch() {
+  # Prefer local master/main, else fallback to origin/* if local not present
   if git show-ref --verify --quiet refs/heads/master; then
-    echo "master"; return 0
+    echo master
+    return
   fi
   if git show-ref --verify --quiet refs/heads/main; then
-    echo "main"; return 0
+    echo main
+    return
   fi
   if git show-ref --verify --quiet refs/remotes/origin/master; then
-    echo "origin/master"; return 0
+    echo origin/master
+    return
   fi
   if git show-ref --verify --quiet refs/remotes/origin/main; then
-    echo "origin/main"; return 0
+    echo origin/main
+    return
   fi
-  if ref=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); then
-    echo "$ref"; return 0
-  fi
-  return 1
+  # Fallback
+  echo master
 }
 
-# Try to resolve default branch, but do not exit if unavailable
-default_branch=""
-if resolved=$(resolve_default_branch); then
-  default_branch="$resolved"
-fi
-log "Default branch: ${default_branch:-<none>}"
+base_branch=$(default_main_branch)
+merge_base=$(git merge-base HEAD "${base_branch}")
+ahead_count=$(git rev-list --count "${merge_base}"..HEAD)
 
-# Are we on the default branch? Normalize names to compare
-simplified_default=${default_branch##*/}
-on_default_branch=false
-if [[ "$current_branch" == "$simplified_default" ]]; then
-  on_default_branch=true
-fi
-log "On default branch? $on_default_branch"
-
-# Find merge-base with default branch and count commits since base
-commits_since_base=0
-if [[ -n "$default_branch" ]]; then
-  merge_base=$(git merge-base "$current_commit" "$default_branch")
-  commits_since_base=$(git rev-list --count "$merge_base..$current_commit")
-fi
-log "Commits since base: $commits_since_base"
-
-# Choose diff base
-# Helper: determine if current commit has a parent
-if git rev-parse --verify -q "$current_commit^" >/dev/null; then
-  has_parent=true
+left_ref=""
+right_ref="HEAD"
+if [[ "${ahead_count}" == "1" ]]; then
+  # First commit on branch: compare branch head to master/main head
+  left_ref="${base_branch}"
 else
-  has_parent=false
+  # Compare current commit to its immediate parent
+  left_ref="HEAD^"
 fi
 
-# Helper: empty tree for initial commit diffs
-empty_tree=$(git hash-object -t tree /dev/null)
+# Generate a unified diff with zero context for precise hunk ranges
+# Include file operations we care about; exclude binary diffs from content but keep headers
+diff_output=$(git diff --unified=0 --no-color --no-ext-diff --diff-filter=ACDMRTUXB "${left_ref}" "${right_ref}" || true)
 
-# Choose diff base without exiting on missing default branch
-if $on_default_branch; then
-  if $has_parent; then
-    diff_base="$current_commit^"
-  else
-    diff_base="$empty_tree"
-  fi
-else
-  if [[ -n "$default_branch" && "$commits_since_base" -le 1 ]]; then
-    diff_base=$(git rev-parse "$default_branch")
-  else
-    if $has_parent; then
-      diff_base="$current_commit^"
-    else
-      diff_base="$empty_tree"
-    fi
-  fi
-fi
-log "Diff base: $diff_base"
-
-# Get changed files (portable, avoids mapfile)
-changed_files=()
-while IFS= read -r path; do
-  if [[ -n "$path" ]]; then
-    changed_files+=("$path")
-  fi
-done < <(git diff --name-only "$diff_base" "$current_commit")
-log "Changed files count: ${#changed_files[@]}"
-
-if [[ ${#changed_files[@]} -eq 0 ]]; then
-  log "No changes detected."
+# If no diff, exit quietly
+if [[ -z "${diff_output}" ]]; then
+  exit 0
 fi
 
-created_files=()
+# Parse diff and write per-hunk files
+awk -v repo_root="${repo_root}" '
+  function trim_prefix(path,   p) {
+    p = path
+    sub(/^a\//, "", p)
+    sub(/^b\//, "", p)
+    return p
+  }
 
-for path in "${changed_files[@]}"; do
-  added=0
-  deleted=0
-  if line=$(git diff --numstat "$diff_base" "$current_commit" -- "$path" | head -n1); then
-    a=${line%%$'\t'*}; rest=${line#*$'\t'}; d=${rest%%$'\t'*}
-    if [[ "$a" != "-" ]]; then added=$a; fi
-    if [[ "$d" != "-" ]]; then deleted=$d; fi
-  fi
+  function parse_range(spec, arr,   m) {
+    # spec like "+123,4" or "-7" (count defaults to 1)
+    if (match(spec, /([+-])([0-9]+)(,([0-9]+))?/, m)) {
+      arr["sign"] = m[1]
+      arr["start"] = m[2] + 0
+      arr["count"] = (m[4] != "" ? m[4] + 0 : 1)
+      return 1
+    }
+    return 0
+  }
 
-  dir=$(dirname "$path")
-  base=$(basename "$path")
-  suffix="${added}-${deleted}.diff"
-  target_dir="$dir"
-  if [[ ! -d "$target_dir" ]]; then
-    target_dir="."
-  fi
-  out_file="$target_dir/${base}.${suffix}"
+  function start_hunk_file(old_path, new_path, old_spec, new_spec,   oldR, newR, target_path, disp_start, disp_end, clean_new, clean_old, dir, base, out_path) {
+    # Determine display range and target source path
+    parse_range(old_spec, oldR)
+    parse_range(new_spec, newR)
 
-  mkdir -p "$target_dir"
-  git diff "$diff_base" "$current_commit" -- "$path" > "$out_file" || true
-  if [[ ! -s "$out_file" ]]; then
-    rm -f "$out_file"
-    log "Empty diff for $path, skipping"
-    continue
-  fi
-  created_files+=("$out_file")
-  log "Created: $out_file"
+    clean_new = (new_path == "/dev/null" ? "" : trim_prefix(new_path))
+    clean_old = (old_path == "/dev/null" ? "" : trim_prefix(old_path))
 
-done
+    if (newR["count"] > 0 && clean_new != "") {
+      disp_start = newR["start"]
+      disp_end   = newR["start"] + newR["count"] - 1
+      target_path = clean_new
+    } else {
+      # Pure deletion or no new lines: use old range
+      disp_start = oldR["start"]
+      disp_end   = oldR["start"] + oldR["count"] - 1
+      target_path = (clean_old != "" ? clean_old : clean_new)
+    }
 
-for f in "${created_files[@]}"; do
-  printf "%s\n" "$f"
-done
+    if (target_path == "") {
+      # Nothing to do
+      writing = 0
+      return
+    }
+
+    # Compute output file path near the source file
+    # out_path = dirname(target_path) + "/" + basename(target_path) + ".START-END.diff"
+    dir = target_path
+    base = target_path
+    sub(/^(.*)\/(.+)$/, "\\1", dir)
+    if (dir == base) { dir = "." } # file in repo root
+    sub(/^.*\//, "", base)
+
+    out_path = repo_root "/" dir "/" base "." disp_start "-" disp_end ".diff"
+
+    # Open new file for writing
+    close(current_out)
+    current_out = out_path
+    print current_out
+
+    # Write minimal headers for context
+    print "--- " old_path > current_out
+    print "+++ " new_path > current_out
+    print current_hunk_header > current_out
+    writing = 1
+  }
+
+  BEGIN {
+    current_out = ""
+    writing = 0
+    old_path = ""
+    new_path = ""
+    current_hunk_header = ""
+  }
+
+  /^diff --git / {
+    # New file section; reset paths and stop writing to previous hunk file
+    writing = 0
+    old_path = ""
+    new_path = ""
+    next
+  }
+
+  /^--- / {
+    old_path = $2
+    next
+  }
+
+  /^\+\+\+ / {
+    new_path = $2
+    next
+  }
+
+  /^@@ / {
+    # Hunk header like: @@ -oldStart,oldCount +newStart,newCount @@
+    current_hunk_header = $0
+    # Extract range specs (fields 2 and 3)
+    # Example tokens: "@@", "-12,3", "+15,2", "@@"
+    old_spec = $2
+    new_spec = $3
+    start_hunk_file(old_path, new_path, old_spec, new_spec)
+    next
+  }
+
+  {
+    if (writing) {
+      # Write hunk body lines until next hunk/file header
+      print $0 > current_out
+    }
+  }
+' <<< "${diff_output}" | tee /dev/stderr | grep -E '\.diff$' || true
+
+# Note: The awk prints each created filename to stdout before writing the hunk.
+# The tee to stderr lets users see progress while preserving stdout as the list of files.
 
 
