@@ -88,13 +88,16 @@ while IFS= read -r -d '' file; do
         # New hunk starts; flush previous
         flush_hunk
 
-        # Extract +newStart and optional ,newLen
-        # Transform header to a simple token we can parse
+        # Extract +newStart and optional ,newLen using grep for BSD compatibility
         header="$line"
-        # Get the "+c,d" or "+c" part
-        plus_part=$(printf '%s' "$header" | sed -E 's/^@@ [^+]*\+([^ ]*) .*/\1/; t; s/^@@ [^+]*\+([^ ]*)\s*@@.*/\1/')
-        new_start=$(printf '%s' "$plus_part" | cut -d',' -f1)
-        new_len=$(printf '%s' "$plus_part" | awk -F',' '{print ($2==""?1:$2)}')
+        plus_part=$(printf '%s' "$header" | grep -oE '\+[0-9]+(,[0-9]+)?' | head -n1 || true)
+        plus_part=${plus_part#+}
+        new_start=${plus_part%%,*}
+        if [ "$plus_part" = "$new_start" ]; then
+          new_len=1
+        else
+          new_len=${plus_part#*,}
+        fi
 
         # Skip deletion-only hunks (new_len == 0)
         if [ "$new_len" -eq 0 ] 2>/dev/null; then
