@@ -2,6 +2,142 @@
 
 set -euo pipefail
 
+# Determine repository root and ensure we're inside a git repo
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Error: Not inside a git repository" >&2
+  exit 1
+fi
+
+# Resolve base reference: if the current commit is the first unique commit on this branch
+# relative to master, diff against master; otherwise, diff against the previous commit (HEAD~1).
+
+# Prefer local 'master'; fallback to 'origin/master' if needed
+resolve_master_ref() {
+  if git rev-parse --verify master >/dev/null 2>&1; then
+    echo master
+  elif git rev-parse --verify origin/master >/dev/null 2>&1; then
+    echo origin/master
+  else
+    echo "Error: Neither 'master' nor 'origin/master' exists" >&2
+    exit 1
+  fi
+}
+
+MASTER_REF=$(resolve_master_ref)
+
+# Count commits unique to HEAD compared to master
+RIGHT_ONLY=$(git rev-list --right-only --count "$MASTER_REF"...HEAD)
+
+if [ "$RIGHT_ONLY" -eq 1 ]; then
+  BASE_REF="$MASTER_REF"
+else
+  BASE_REF="HEAD~1"
+fi
+
+# Gather changed files between BASE_REF and HEAD, null-delimited to handle spaces
+# Exclude deleted files since there's no destination to save alongside
+if git diff --quiet --diff-filter=ACMR "$BASE_REF" HEAD; then
+  exit 0
+fi
+
+# Iterate null-delimited file list
+output_files=()
+while IFS= read -r -d '' file; do
+  # Get per-file diff with zero context to isolate exact changed lines
+  # --no-color to simplify parsing
+  diff_output=$(git diff -U0 --no-color "$BASE_REF" HEAD -- "$file" || true)
+
+  # Skip if diff is empty for this file
+  [ -z "$diff_output" ] && continue
+
+  # Parse hunks and write each hunk to its own .start-end.diff file near the source file
+  # We detect hunk headers of the form: @@ -oldStart,oldLen +newStart,newLen @@ ...
+  # Notes:
+  #  - newLen may be omitted (defaults to 1)
+  #  - When newLen == 0, the hunk represents a deletion; skip since there is no new range
+  #  - We capture lines from the hunk header until the next hunk header or end of per-file diff
+
+  tmpfile=$(mktemp)
+  printf '%s\n' "$diff_output" >"$tmpfile"
+
+  dir_path=$(dirname -- "$file")
+  base_name=$(basename -- "$file")
+
+  # Read the diff and split by hunks
+  in_hunk=0
+  hunk_buf=""
+  start_line=0
+  end_line=0
+
+  flush_hunk() {
+    if [ "$in_hunk" -eq 1 ] && [ "$start_line" -gt 0 ] && [ "$end_line" -ge "$start_line" ]; then
+      out_path="$dir_path/${base_name}.${start_line}-${end_line}.diff"
+      # Write the buffered hunk content
+      printf '%s\n' "$hunk_buf" > "$out_path"
+      output_files+=("$out_path")
+    fi
+    in_hunk=0
+    hunk_buf=""
+    start_line=0
+    end_line=0
+  }
+
+  while IFS= read -r line; do
+    case "$line" in
+      @@\ -*\ +*@@*)
+        # New hunk starts; flush previous
+        flush_hunk
+
+        # Extract +newStart and optional ,newLen
+        # Transform header to a simple token we can parse
+        header="$line"
+        # Get the "+c,d" or "+c" part
+        plus_part=$(printf '%s' "$header" | sed -E 's/^@@ [^+]*\+([^ ]*) .*/\1/; t; s/^@@ [^+]*\+([^ ]*)\s*@@.*/\1/')
+        new_start=$(printf '%s' "$plus_part" | cut -d',' -f1)
+        new_len=$(printf '%s' "$plus_part" | awk -F',' '{print ($2==""?1:$2)}')
+
+        # Skip deletion-only hunks (new_len == 0)
+        if [ "$new_len" -eq 0 ] 2>/dev/null; then
+          in_hunk=0
+          hunk_buf=""
+          start_line=0
+          end_line=0
+          # Do not capture this hunk
+          continue
+        fi
+
+        start_line="$new_start"
+        end_line=$(( new_start + new_len - 1 ))
+        in_hunk=1
+        hunk_buf="$line"$'\n'
+        ;;
+      diff\ --git\ *)
+        # New file section encountered; flush any current hunk
+        flush_hunk
+        ;;
+      *)
+        if [ "$in_hunk" -eq 1 ]; then
+          hunk_buf+="$line"$'\n'
+        fi
+        ;;
+    esac
+  done <"$tmpfile"
+
+  # Flush final hunk at EOF
+  flush_hunk
+
+  rm -f -- "$tmpfile"
+done < <(git diff --name-only -z --diff-filter=ACMR "$BASE_REF" HEAD)
+
+# Output created filenames, one per line
+for f in "${output_files[@]:-}"; do
+  printf '%s\n' "$f"
+done
+
+#!/usr/bin/env bash
+
+set -euo pipefail
+
 # git-save-diffs.sh
 #
 # Generates per-hunk diff files for the current commit relative to:
